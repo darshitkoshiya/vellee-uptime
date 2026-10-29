@@ -1,0 +1,641 @@
+# VELLEE LUXE — outside uptime + checkout monitor. Owner guide: docs/UPTIME-MONITOR.md
+# GENERATED from scripts/uptime/check.mjs by scripts/uptime/build-workflow.mjs — do not edit here.
+# Paste this whole file into GitHub as .github/workflows/uptime.yml (no other file is needed).
+# Secrets (Settings -> Secrets and variables -> Actions -> Secrets): UPTIME_REPORT_SECRET,
+#   UPTIME_EMAIL_API_KEY, UPTIME_EMAIL_TO. Variables (same page, Variables tab): UPTIME_EMAIL_FROM,
+#   optional UPTIME_EMAIL_PROVIDER (brevo | mailersend | resend), UPTIME_SITE_URL, UPTIME_ADMIN_URL,
+#   UPTIME_PRODUCT_PATH, UPTIME_MODE.
+# It only reads public pages and does ONE read-only bag check with a dummy item: it never places an
+# order or takes a payment. The run always ends green; alerts come by email / WhatsApp instead.
+name: uptime
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      UPTIME_SITE_URL: ${{ vars.UPTIME_SITE_URL }}
+      UPTIME_ADMIN_URL: ${{ vars.UPTIME_ADMIN_URL }}
+      UPTIME_PRODUCT_PATH: ${{ vars.UPTIME_PRODUCT_PATH }}
+      UPTIME_MODE: ${{ vars.UPTIME_MODE }}
+      UPTIME_EMAIL_PROVIDER: ${{ vars.UPTIME_EMAIL_PROVIDER }}
+      UPTIME_EMAIL_FROM: ${{ vars.UPTIME_EMAIL_FROM }}
+      UPTIME_REPORT_SECRET: ${{ secrets.UPTIME_REPORT_SECRET }}
+      UPTIME_EMAIL_API_KEY: ${{ secrets.UPTIME_EMAIL_API_KEY }}
+      UPTIME_EMAIL_TO: ${{ secrets.UPTIME_EMAIL_TO }}
+    steps:
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 20
+
+      # Remembers "failed last time?" / "already alerted?" between runs (newest cache wins).
+      - name: Restore monitor state
+        uses: actions/cache/restore@v4
+        with:
+          path: uptime-state.json
+          key: uptime-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: uptime-state-
+
+      - name: Check the website
+        run: |
+          cat > "$RUNNER_TEMP/check.mjs" <<'VL_UPTIME_SCRIPT_EOF'
+          #!/usr/bin/env node
+          // VELLEE LUXE — outside uptime + checkout monitor (runs on GitHub Actions, OUTSIDE Cloudflare).
+          // Owner guide: docs/UPTIME-MONITOR.md. No npm dependencies (Node >= 20). Never places an order,
+          // never takes a payment, never logs a secret or a response body.
+          //
+          // Checks (each one GET/POST, 15 s timeout):
+          //   home      GET  {site}/                    200 + "VELLEE LUXE" in the page
+          //   product   GET  {site}{product path}       200 + brand (path: UPTIME_PRODUCT_PATH, else the first
+          //                                             /products/… URL of /sitemap.xml, remembered 24 h)
+          //   api       GET  {site}/api/health          LIVE: 200 {status:"ok"} · preview mode: 403 site_building
+          //   checkout  POST {site}/api/cart/validate   read-only bag check with ONE dummy SKU id
+          //                                             LIVE: 200 {items:[…]} · preview mode: 403 site_building
+          //   admin     GET  {admin health URL}         200 / 401 / 403, or a redirect to Cloudflare Access
+          // Mode (UPTIME_MODE = auto | live | building; default auto): the api answer decides — 200 = live,
+          // 403 site_building = the store is still in preview (BUILDING) mode.
+          //
+          // Alerting (state kept between runs in a small JSON file, restored by actions/cache):
+          //   2 failed runs in a row → ONE "down" alert; the first passing run after that → ONE "recovered".
+          //   Every run is posted, HMAC-signed, to {site}/api/uptime/report (Admin → Settings → Site health);
+          //   for an event our system raises the alert (WhatsApp / ops email) and says whether it was
+          //   delivered. If it was not — or our system is unreachable — this script emails the Owner directly
+          //   through its own provider key (Brevo, MailerSend or Resend). An undelivered alert is retried on
+          //   the next runs (max 6).
+          //
+          // Env: UPTIME_SITE_URL (https://velleeluxe.com), UPTIME_ADMIN_URL
+          //      (https://vladmin.velleeluxe.com/admin-api/health), UPTIME_PRODUCT_PATH (optional),
+          //      UPTIME_MODE, UPTIME_REPORT_SECRET (≥ 32 chars; same value as the Cloudflare secret),
+          //      UPTIME_EMAIL_PROVIDER (brevo | mailersend | resend), UPTIME_EMAIL_API_KEY,
+          //      UPTIME_EMAIL_FROM (a verified sender), UPTIME_EMAIL_TO (comma-separated, ≤ 3),
+          //      GITHUB_RUN_ID / GITHUB_RUN_ATTEMPT (set by GitHub).
+          // CLI:  node check.mjs <state-file>
+
+          import { createHmac } from "node:crypto";
+          import { existsSync, readFileSync, writeFileSync } from "node:fs";
+          import { pathToFileURL } from "node:url";
+
+          export const BRAND_RE = /vellee\s*luxe/i;
+          export const TIMEOUT_MS = 15_000;
+          export const FAILS_FOR_DOWN = 2;
+          export const PRODUCT_PATH_TTL_S = 24 * 60 * 60;
+          export const MAX_ALERT_RETRIES = 6;
+          export const DUMMY_SKU = "uptime-probe-not-a-real-sku";
+          export const UA = "VELLEE-LUXE-uptime/1 (+github-actions)";
+          export const CHECK_LABEL = {
+            home: "Home page",
+            product: "Product page",
+            api: "Store API health",
+            checkout: "Checkout (bag check)",
+            admin: "Admin",
+          };
+
+          export const DEFAULT_STATE = Object.freeze({
+            v: 1,
+            fails: 0,
+            down: false,
+            downSince: null,
+            mode: "unknown",
+            productPath: null,
+            productPathAt: 0,
+            pending: null,
+          });
+
+          const trimSlash = (u) => String(u || "").replace(/\/+$/, "");
+
+          export function config(env = process.env) {
+            const site = trimSlash(env.UPTIME_SITE_URL || "https://velleeluxe.com");
+            const to = String(env.UPTIME_EMAIL_TO || "")
+              .split(",")
+              .map((s) => s.trim())
+              .filter((s) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s))
+              .slice(0, 3);
+            const mode = String(env.UPTIME_MODE || "auto")
+              .trim()
+              .toLowerCase();
+            return {
+              site,
+              adminUrl: String(
+                env.UPTIME_ADMIN_URL || "https://vladmin.velleeluxe.com/admin-api/health"
+              ).trim(),
+              productPath: normalisePath(env.UPTIME_PRODUCT_PATH),
+              mode: mode === "live" || mode === "building" ? mode : "auto",
+              secret: String(env.UPTIME_REPORT_SECRET || "").trim(),
+              email: {
+                provider: String(env.UPTIME_EMAIL_PROVIDER || "brevo")
+                  .trim()
+                  .toLowerCase(),
+                apiKey: String(env.UPTIME_EMAIL_API_KEY || "").trim(),
+                from: String(env.UPTIME_EMAIL_FROM || "").trim(),
+                to,
+              },
+              runId: `${env.GITHUB_RUN_ID || `local-${Date.now()}`}-${env.GITHUB_RUN_ATTEMPT || "1"}`,
+            };
+          }
+
+          export function normalisePath(p) {
+            const s = String(p || "").trim();
+            if (!s) return null;
+            try {
+              const u = new URL(s, "https://x.invalid");
+              return u.pathname + u.search;
+            } catch {
+              return null;
+            }
+          }
+
+          async function timed(fetchImpl, url, init = {}) {
+            const t0 = Date.now();
+            try {
+              const res = await fetchImpl(url, {
+                redirect: "manual",
+                ...init,
+                headers: { "User-Agent": UA, "Cache-Control": "no-cache", ...(init.headers || {}) },
+                signal: AbortSignal.timeout(TIMEOUT_MS),
+              });
+              const text = init.noBody ? "" : await res.text().catch(() => "");
+              return { res, text, ms: Date.now() - t0, error: null };
+            } catch (e) {
+              const timeout = e && (e.name === "TimeoutError" || e.name === "AbortError");
+              return {
+                res: null,
+                text: "",
+                ms: Date.now() - t0,
+                error: timeout ? "timed out after 15 s" : "no answer (network error)",
+              };
+            }
+          }
+
+          const challengeNote = (res) =>
+            res?.headers && /challenge/i.test(res.headers.get("cf-mitigated") || "")
+              ? "Cloudflare bot challenge blocked the monitor (see docs/UPTIME-MONITOR.md)"
+              : null;
+
+          function result(id, r, ok, note) {
+            return {
+              id,
+              ok,
+              status: r.res ? r.res.status : null,
+              ms: r.ms,
+              note: ok ? note || null : r.error || challengeNote(r.res) || note || null,
+            };
+          }
+
+          function jsonOf(text) {
+            try {
+              return JSON.parse(text);
+            } catch {
+              return null;
+            }
+          }
+
+          const isBuildingGate = (r) => r.res?.status === 403 && jsonOf(r.text)?.code === "site_building";
+
+          export async function checkPage(fetchImpl, id, url) {
+            const r = await timed(fetchImpl, url, { headers: { Accept: "text/html" } });
+            if (!r.res) return result(id, r, false);
+            if (r.res.status !== 200) return result(id, r, false, "expected 200");
+            if (!BRAND_RE.test(r.text))
+              return result(id, r, false, "page loaded but the brand name is missing");
+            return result(id, r, true);
+          }
+
+          export async function checkApi(fetchImpl, site) {
+            const r = await timed(fetchImpl, `${site}/api/health`, {
+              headers: { Accept: "application/json" },
+            });
+            if (r.res?.status === 200 && jsonOf(r.text)?.status === "ok")
+              return { check: result("api", r, true), mode: "live" };
+            if (isBuildingGate(r))
+              return {
+                check: result("api", r, true, "preview mode: closed to guests as expected"),
+                mode: "building",
+              };
+            return { check: result("api", r, false, r.res ? "unexpected answer" : null), mode: null };
+          }
+
+          export async function checkCheckout(fetchImpl, site, mode) {
+            const r = await timed(fetchImpl, `${site}/api/cart/validate`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json", Accept: "application/json" },
+              body: JSON.stringify({ items: [{ skuId: DUMMY_SKU, quantity: 1 }] }),
+            });
+            if (!r.res) return result("checkout", r, false);
+            if (mode === "building") {
+              return isBuildingGate(r)
+                ? result("checkout", r, true, "preview mode: closed to guests as expected")
+                : result("checkout", r, false, "expected the preview-mode answer (403)");
+            }
+            const body = jsonOf(r.text);
+            if (
+              r.res.status === 200 &&
+              body &&
+              Array.isArray(body.items) &&
+              body.items.length === 1 &&
+              body.items[0].valid === false
+            )
+              return result("checkout", r, true);
+            return result("checkout", r, false, "bag check did not answer as expected");
+          }
+
+          export async function checkAdmin(fetchImpl, url) {
+            const r = await timed(fetchImpl, url, { headers: { Accept: "application/json" }, noBody: true });
+            if (!r.res) return result("admin", r, false);
+            const s = r.res.status;
+            if (s === 200 || s === 401 || s === 403) return result("admin", r, true);
+            if (s >= 300 && s < 400) {
+              let host = "";
+              try {
+                host = new URL(r.res.headers.get("location") || "", url).hostname;
+              } catch {
+                host = "";
+              }
+              if (/(^|\.)cloudflareaccess\.com$/i.test(host))
+                return result("admin", r, true, "Cloudflare Access sign-in (expected)");
+              return result("admin", r, false, "unexpected redirect");
+            }
+            return result("admin", r, false, "expected 200, 401 or 403");
+          }
+
+          /** First /products/{family}/{colour} URL of the sitemap (follows ONE sitemap index level). */
+          export async function discoverProductPath(fetchImpl, site) {
+            const locs = async (url) => {
+              const r = await timed(fetchImpl, url, { headers: { Accept: "application/xml" } });
+              if (r.res?.status !== 200) return { index: false, list: [] };
+              const list = [...r.text.matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/g)].map((m) => m[1]);
+              return { index: /<sitemapindex/i.test(r.text), list };
+            };
+            const top = await locs(`${site}/sitemap.xml`);
+            let list = top.list;
+            if (top.index) {
+              list = [];
+              for (const child of top.list.slice(0, 3)) {
+                list = (await locs(child)).list;
+                if (list.some((l) => /\/products\/[^/]+\/[^/]+/.test(l))) break;
+              }
+            }
+            const hit = list.find((l) => /\/products\/[^/]+\/[^/]+/.test(l));
+            return hit ? normalisePath(hit) : null;
+          }
+
+          /** Runs every check; returns { checks, mode, state } (state gets the remembered product path). */
+          export async function runChecks(
+            cfg,
+            prevState,
+            fetchImpl = fetch,
+            nowS = Math.floor(Date.now() / 1000)
+          ) {
+            const state = { ...prevState };
+            const api = await checkApi(fetchImpl, cfg.site);
+            const mode =
+              cfg.mode !== "auto" ? cfg.mode : api.mode || (state.mode !== "unknown" ? state.mode : "live");
+            if (cfg.mode !== "auto" && api.mode && api.mode !== cfg.mode) {
+              api.check.ok = false;
+              api.check.note = `expected ${cfg.mode} mode, the site answered as ${api.mode}`;
+            }
+
+            let productPath = cfg.productPath;
+            let discovered = false;
+            if (!productPath && mode === "live") {
+              if (state.productPath && nowS - (state.productPathAt || 0) < PRODUCT_PATH_TTL_S)
+                productPath = state.productPath;
+              else {
+                // The sitemap may be paused (free-limit protection): keep the old page when it answers nothing.
+                const found = await discoverProductPath(fetchImpl, cfg.site);
+                productPath = found || state.productPath;
+                discovered = !!found;
+              }
+            }
+            if (!productPath && mode === "building") productPath = "/products";
+
+            const [home, checkout, admin] = await Promise.all([
+              checkPage(fetchImpl, "home", `${cfg.site}/`),
+              checkCheckout(fetchImpl, cfg.site, mode),
+              checkAdmin(fetchImpl, cfg.adminUrl),
+            ]);
+            let product;
+            if (!productPath) {
+              product = {
+                id: "product",
+                ok: false,
+                status: null,
+                ms: null,
+                note: "no product page found in the sitemap — set UPTIME_PRODUCT_PATH",
+              };
+            } else {
+              product = await checkPage(fetchImpl, "product", `${cfg.site}${productPath}`);
+              // A remembered page may have been removed: look again once, in the same run.
+              if (
+                !product.ok &&
+                product.status === 404 &&
+                !cfg.productPath &&
+                !discovered &&
+                mode === "live"
+              ) {
+                const again = await discoverProductPath(fetchImpl, cfg.site);
+                discovered = true;
+                if (again && again !== productPath) {
+                  productPath = again;
+                  product = await checkPage(fetchImpl, "product", `${cfg.site}${productPath}`);
+                }
+              }
+            }
+            if (!cfg.productPath && mode === "live") {
+              if (product.ok) {
+                if (discovered || state.productPath !== productPath) state.productPathAt = nowS;
+                state.productPath = productPath;
+              } else if (product.status === 404) {
+                state.productPath = null;
+                state.productPathAt = 0;
+              }
+            }
+            state.mode = mode;
+            return { checks: [home, product, api.check, checkout, admin], mode, state };
+          }
+
+          /** 2 failures in a row → "down" once; first pass after that → "recovered" once. */
+          export function evaluate(prevState, ok, nowS) {
+            const s = { ...prevState };
+            let event = null;
+            let eventDownSince = null;
+            if (ok) {
+              if (s.down) {
+                event = "recovered";
+                eventDownSince = s.downSince;
+              }
+              s.fails = 0;
+              s.down = false;
+              s.downSince = null;
+            } else {
+              if (!s.fails) s.downSince = nowS;
+              s.fails = (s.fails || 0) + 1;
+              if (s.fails >= FAILS_FOR_DOWN && !s.down) {
+                s.down = true;
+                event = "down";
+                eventDownSince = s.downSince;
+              }
+            }
+            return { state: s, event, eventDownSince };
+          }
+
+          export function sign(secret, timestamp, body) {
+            return createHmac("sha256", secret).update(`${timestamp}.${body}`).digest("hex");
+          }
+
+          /** POST the signed run report. Returns { ok, alertSent } — never throws. */
+          export async function postReport(cfg, report, fetchImpl = fetch) {
+            if (cfg.secret.length < 32)
+              return {
+                ok: false,
+                alertSent: false,
+                error: "UPTIME_REPORT_SECRET not set (or shorter than 32)",
+              };
+            const body = JSON.stringify(report);
+            const ts = String(Math.floor(Date.now() / 1000));
+            try {
+              const res = await fetchImpl(`${cfg.site}/api/uptime/report`, {
+                method: "POST",
+                redirect: "manual",
+                headers: {
+                  "Content-Type": "application/json",
+                  "User-Agent": UA,
+                  "X-Uptime-Timestamp": ts,
+                  "X-Uptime-Signature": `sha256=${sign(cfg.secret, ts, body)}`,
+                },
+                body,
+                signal: AbortSignal.timeout(30_000),
+              });
+              const json = jsonOf(await res.text().catch(() => ""));
+              if (!res.ok)
+                return {
+                  ok: false,
+                  alertSent: false,
+                  error: `report answered HTTP ${res.status}${json?.error ? ` (${json.error})` : ""}`,
+                };
+              return { ok: true, alertSent: json?.alert?.sent === true, error: null };
+            } catch {
+              return { ok: false, alertSent: false, error: "report could not reach our system" };
+            }
+          }
+
+          const esc = (s) =>
+            String(s).replace(
+              /[&<>"']/g,
+              (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]
+            );
+
+          export function istLabel(unixS) {
+            const d = new Date((unixS + 330 * 60) * 1000);
+            const mon = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][
+              d.getUTCMonth()
+            ];
+            return `${d.getUTCDate()} ${mon}, ${String(d.getUTCHours()).padStart(2, "0")}:${String(d.getUTCMinutes()).padStart(2, "0")} IST`;
+          }
+
+          export function alertEmail(event, downSince, checks, nowS, site) {
+            const since = downSince || nowS;
+            if (event === "down") {
+              const bad = checks.filter((c) => !c.ok);
+              const lines = bad.map(
+                (c) =>
+                  `${CHECK_LABEL[c.id]}: ${c.status ? `HTTP ${c.status}` : "no answer"}${c.note ? ` — ${c.note}` : ""}`
+              );
+              const text = `VELLEE LUXE (${site}) failed its outside check twice in a row, since ${istLabel(since)}.\n\nFailing:\n- ${lines.join("\n- ")}\n\nChecked from GitHub Actions every 5 minutes. You will get ONE more email when it is back.\nAdmin → Settings → Site health shows the details (if Admin is up).`;
+              return {
+                subject: `VELLEE LUXE site DOWN since ${istLabel(since)}`,
+                text,
+                html: `<p><strong>VELLEE LUXE (${esc(site)}) failed its outside check twice in a row</strong>, since ${esc(istLabel(since))}.</p><p>Failing:</p><ul>${lines.map((l) => `<li>${esc(l)}</li>`).join("")}</ul><p>Checked from GitHub Actions every 5 minutes. You will get ONE more email when it is back. Admin → Settings → Site health shows the details (if Admin is up).</p>`,
+              };
+            }
+            const mins = Math.max(0, Math.round((nowS - since) / 60));
+            const text = `VELLEE LUXE (${site}) is back up: every outside check passed at ${istLabel(nowS)} (down about ${mins} minutes since ${istLabel(since)}).`;
+            return { subject: "VELLEE LUXE site is back up", text, html: `<p>${esc(text)}</p>` };
+          }
+
+          /** Direct email through the Owner's provider key (GitHub secret). Returns true when accepted. */
+          export async function sendDirectEmail(cfg, mail, fetchImpl = fetch) {
+            const { provider, apiKey, from, to } = cfg.email;
+            if (!apiKey || !from || to.length === 0)
+              return {
+                sent: false,
+                error: "direct email not configured (UPTIME_EMAIL_API_KEY / _FROM / _TO)",
+              };
+            let url;
+            let headers;
+            let body;
+            if (provider === "mailersend") {
+              url = "https://api.mailersend.com/v1/email";
+              headers = { Authorization: `Bearer ${apiKey}` };
+              body = {
+                from: { email: from, name: "VELLEE LUXE monitor" },
+                to: to.map((email) => ({ email })),
+                subject: mail.subject,
+                html: mail.html,
+                text: mail.text,
+              };
+            } else if (provider === "resend") {
+              url = "https://api.resend.com/emails";
+              headers = { Authorization: `Bearer ${apiKey}` };
+              body = {
+                from: `VELLEE LUXE monitor <${from}>`,
+                to,
+                subject: mail.subject,
+                html: mail.html,
+                text: mail.text,
+              };
+            } else {
+              url = "https://api.brevo.com/v3/smtp/email";
+              headers = { "api-key": apiKey };
+              body = {
+                sender: { email: from, name: "VELLEE LUXE monitor" },
+                to: to.map((email) => ({ email })),
+                subject: mail.subject,
+                htmlContent: mail.html,
+                textContent: mail.text,
+              };
+            }
+            try {
+              const res = await fetchImpl(url, {
+                method: "POST",
+                headers: { "Content-Type": "application/json", Accept: "application/json", ...headers },
+                body: JSON.stringify(body),
+                signal: AbortSignal.timeout(30_000),
+              });
+              return res.ok
+                ? { sent: true, error: null }
+                : { sent: false, error: `${provider} answered HTTP ${res.status}` };
+            } catch {
+              return { sent: false, error: `${provider} could not be reached` };
+            }
+          }
+
+          export function loadState(file) {
+            try {
+              if (file && existsSync(file)) {
+                const s = JSON.parse(readFileSync(file, "utf8"));
+                if (s && s.v === 1) return { ...DEFAULT_STATE, ...s };
+              }
+            } catch {
+              // corrupt / missing → fresh state
+            }
+            return { ...DEFAULT_STATE };
+          }
+
+          /** One monitor run. Returns { report, state, delivery } for logs / tests. */
+          export async function runOnce(
+            cfg,
+            prevState,
+            fetchImpl = fetch,
+            nowS = Math.floor(Date.now() / 1000),
+            log = console.log
+          ) {
+            const run = await runChecks(cfg, prevState, fetchImpl, nowS);
+            const ok = run.checks.every((c) => c.ok);
+            const ev = evaluate(run.state, ok, nowS);
+            const state = ev.state;
+            for (const c of run.checks)
+              log(
+                `${c.ok ? "OK  " : "FAIL"} ${CHECK_LABEL[c.id]}: ${c.status ?? "-"} ${c.ms ?? "-"} ms${c.note ? ` (${c.note})` : ""}`
+              );
+            log(
+              `mode=${run.mode} ok=${ok} consecutiveFailures=${state.fails} down=${state.down}${ev.event ? ` EVENT=${ev.event}` : ""}`
+            );
+
+            const report = {
+              v: 1,
+              runId: cfg.runId,
+              checkedAt: nowS,
+              ok,
+              mode: run.mode,
+              event: ev.event,
+              consecutiveFailures: state.fails,
+              downSince: ev.event ? ev.eventDownSince : state.downSince,
+              checks: run.checks,
+            };
+            const posted = await postReport(cfg, report, fetchImpl);
+            log(posted.ok ? "report stored" : `report NOT stored: ${posted.error}`);
+
+            // Which alert still needs delivering: this run's event, else an earlier undelivered one.
+            let pending = state.pending;
+            if (ev.event)
+              pending = { event: ev.event, downSince: ev.eventDownSince, tries: 0, checks: run.checks };
+            let delivery = null;
+            if (pending) {
+              if (ev.event && posted.alertSent) {
+                pending = null;
+                delivery = "our system";
+              } else {
+                const mail = alertEmail(
+                  pending.event,
+                  pending.downSince,
+                  pending.checks || run.checks,
+                  nowS,
+                  cfg.site
+                );
+                const sent = await sendDirectEmail(cfg, mail, fetchImpl);
+                if (sent.sent) {
+                  pending = null;
+                  delivery = "direct email";
+                } else {
+                  log(`direct email failed: ${sent.error}`);
+                  pending = { ...pending, tries: (pending.tries || 0) + 1 };
+                  if (pending.tries >= MAX_ALERT_RETRIES) {
+                    log("alert given up after 6 tries");
+                    pending = null;
+                  }
+                }
+              }
+              if (delivery) log(`alert delivered by ${delivery}`);
+            }
+            state.pending = pending;
+            return { report, state, delivery };
+          }
+
+          async function main() {
+            const file = process.argv[2] || "uptime-state.json";
+            const cfg = config();
+            const prev = loadState(file);
+            const { state } = await runOnce(cfg, prev);
+            writeFileSync(file, JSON.stringify(state));
+            // Always exit 0: a failing site is reported by our alerts, not by a red GitHub run every 5 min.
+          }
+
+          if (import.meta.url === pathToFileURL(process.argv[1] || "").href) {
+            main().catch((e) => {
+              console.error(`monitor error: ${e?.message ? e.message : "unknown"}`);
+            });
+          }
+          VL_UPTIME_SCRIPT_EOF
+          node "$RUNNER_TEMP/check.mjs" uptime-state.json
+
+      - name: Save monitor state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: uptime-state.json
+          key: uptime-state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # GitHub pauses scheduled workflows in public repositories after 60 days without activity.
+      # During the 00:xx UTC hour this re-enables the workflow (allowed by "actions: write"), which
+      # keeps it running. If GitHub still pauses it, our own system alerts you after 60 silent minutes.
+      - name: Keep the schedule alive
+        if: always() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$(date -u +%H)" = "00" ]; then
+            gh api -X PUT "repos/${{ github.repository }}/actions/workflows/uptime.yml/enable" >/dev/null && echo "schedule kept alive" || echo "keep-alive skipped"
+          fi
